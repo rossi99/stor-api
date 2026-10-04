@@ -1,6 +1,0 @@
-DROP TABLE IF EXISTS monthly_snapshots;
-DROP TABLE IF EXISTS tax_info;
-DROP TABLE IF EXISTS isas;
-DROP TABLE IF EXISTS pensions;
-DROP TABLE IF EXISTS savings_pots;
-DROP TABLE IF EXISTS incomes;
