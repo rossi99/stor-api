@@ -51,6 +51,17 @@ func (q *Queries) CompleteSetup(ctx context.Context, id pgtype.UUID) error {
 	return err
 }
 
+const countBills = `-- name: CountBills :one
+SELECT count(*) FROM bills WHERE household_id = $1
+`
+
+func (q *Queries) CountBills(ctx context.Context, householdID pgtype.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countBills, householdID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const createHousehold = `-- name: CreateHousehold :one
 INSERT INTO households DEFAULT VALUES RETURNING id
 `
@@ -149,6 +160,34 @@ func (q *Queries) DeleteMembersBeyond(ctx context.Context, arg DeleteMembersBeyo
 	return err
 }
 
+const deletePersonalBills = `-- name: DeletePersonalBills :exec
+DELETE FROM bills WHERE household_id = $1 AND paid_from = $2::smallint
+`
+
+type DeletePersonalBillsParams struct {
+	HouseholdID pgtype.UUID
+	Slot        int16
+}
+
+func (q *Queries) DeletePersonalBills(ctx context.Context, arg DeletePersonalBillsParams) error {
+	_, err := q.db.Exec(ctx, deletePersonalBills, arg.HouseholdID, arg.Slot)
+	return err
+}
+
+const deletePersonalTransactions = `-- name: DeletePersonalTransactions :exec
+DELETE FROM transactions WHERE household_id = $1 AND ledger_slot = $2::smallint
+`
+
+type DeletePersonalTransactionsParams struct {
+	HouseholdID pgtype.UUID
+	Slot        int16
+}
+
+func (q *Queries) DeletePersonalTransactions(ctx context.Context, arg DeletePersonalTransactionsParams) error {
+	_, err := q.db.Exec(ctx, deletePersonalTransactions, arg.HouseholdID, arg.Slot)
+	return err
+}
+
 const deleteSession = `-- name: DeleteSession :exec
 DELETE FROM sessions WHERE token_hash = $1
 `
@@ -156,6 +195,46 @@ DELETE FROM sessions WHERE token_hash = $1
 func (q *Queries) DeleteSession(ctx context.Context, tokenHash []byte) error {
 	_, err := q.db.Exec(ctx, deleteSession, tokenHash)
 	return err
+}
+
+const deleteUser = `-- name: DeleteUser :exec
+DELETE FROM users WHERE id = $1
+`
+
+func (q *Queries) DeleteUser(ctx context.Context, id pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, deleteUser, id)
+	return err
+}
+
+const forgetActorName = `-- name: ForgetActorName :exec
+UPDATE transactions SET actor_name = NULL WHERE household_id = $1 AND actor_slot = $2::smallint
+`
+
+type ForgetActorNameParams struct {
+	HouseholdID pgtype.UUID
+	Slot        int16
+}
+
+// Joint spending stays with the household, without the departing member's name on it.
+func (q *Queries) ForgetActorName(ctx context.Context, arg ForgetActorNameParams) error {
+	_, err := q.db.Exec(ctx, forgetActorName, arg.HouseholdID, arg.Slot)
+	return err
+}
+
+const getBillPaidFrom = `-- name: GetBillPaidFrom :one
+SELECT paid_from FROM bills WHERE household_id = $1 AND id = $2
+`
+
+type GetBillPaidFromParams struct {
+	HouseholdID pgtype.UUID
+	ID          string
+}
+
+func (q *Queries) GetBillPaidFrom(ctx context.Context, arg GetBillPaidFromParams) (int16, error) {
+	row := q.db.QueryRow(ctx, getBillPaidFrom, arg.HouseholdID, arg.ID)
+	var paid_from int16
+	err := row.Scan(&paid_from)
+	return paid_from, err
 }
 
 const getBudgetSettings = `-- name: GetBudgetSettings :one
@@ -201,6 +280,17 @@ func (q *Queries) GetMemberByUser(ctx context.Context, userID pgtype.UUID) (GetM
 	var i GetMemberByUserRow
 	err := row.Scan(&i.HouseholdID, &i.Slot, &i.SetupComplete)
 	return i, err
+}
+
+const getPasswordHash = `-- name: GetPasswordHash :one
+SELECT password_hash FROM users WHERE id = $1
+`
+
+func (q *Queries) GetPasswordHash(ctx context.Context, id pgtype.UUID) (string, error) {
+	row := q.db.QueryRow(ctx, getPasswordHash, id)
+	var password_hash string
+	err := row.Scan(&password_hash)
+	return password_hash, err
 }
 
 const getSessionMember = `-- name: GetSessionMember :one
@@ -612,6 +702,37 @@ func (q *Queries) OpenSeat(ctx context.Context, householdID pgtype.UUID) (int16,
 	return slot, err
 }
 
+const otherAccountsInHousehold = `-- name: OtherAccountsInHousehold :one
+SELECT EXISTS (SELECT 1 FROM members WHERE household_id = $1 AND slot <> $2::smallint AND user_id IS NOT NULL)
+`
+
+type OtherAccountsInHouseholdParams struct {
+	HouseholdID pgtype.UUID
+	Slot        int16
+}
+
+func (q *Queries) OtherAccountsInHousehold(ctx context.Context, arg OtherAccountsInHouseholdParams) (bool, error) {
+	row := q.db.QueryRow(ctx, otherAccountsInHousehold, arg.HouseholdID, arg.Slot)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
+const releaseSeat = `-- name: ReleaseSeat :exec
+UPDATE members SET user_id = NULL, name = '', net_pay_pence = 0, contribution_pence = 0
+WHERE household_id = $1 AND slot = $2::smallint
+`
+
+type ReleaseSeatParams struct {
+	HouseholdID pgtype.UUID
+	Slot        int16
+}
+
+func (q *Queries) ReleaseSeat(ctx context.Context, arg ReleaseSeatParams) error {
+	_, err := q.db.Exec(ctx, releaseSeat, arg.HouseholdID, arg.Slot)
+	return err
+}
+
 const setBudgetSettings = `-- name: SetBudgetSettings :exec
 UPDATE households SET essential_pct = $2, discretionary_pct = $3, saving_pct = $4,
     loan_allocation_pence = $5, cash_cap_pence = $6
@@ -794,7 +915,7 @@ ON CONFLICT (household_id, id) DO UPDATE SET
     name = EXCLUDED.name, group_name = EXCLUDED.group_name, kind = EXCLUDED.kind, category = EXCLUDED.category,
     amount_pence = EXCLUDED.amount_pence, frequency = EXCLUDED.frequency, months = EXCLUDED.months,
     paid_from = EXCLUDED.paid_from, due_day = EXCLUDED.due_day, meta = EXCLUDED.meta, is_estimated = EXCLUDED.is_estimated
-WHERE bills.paid_from IN (0, $14::smallint)
+WHERE bills.paid_from IN (0, $14::smallint) AND NOT (bills.paid_from = 0 AND EXCLUDED.paid_from <> 0)
 `
 
 type UpsertBillParams struct {

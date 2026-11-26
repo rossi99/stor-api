@@ -1,16 +1,21 @@
 package api
 
 import (
+	"errors"
 	"net/http"
 	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"rossi99/stor/internal/store"
 )
+
+// maxBills keeps one household from storing without limit; the sheet this replaces has about 60.
+const maxBills = 500
 
 type billJSON struct {
 	ID          string  `json:"id"`
@@ -58,6 +63,26 @@ func (s *Server) putBill(w http.ResponseWriter, r *http.Request, v viewer) {
 		!slices.Contains(billFrequencies, b.Frequency) || !monthsOK || !amountOK || amount < 0 ||
 		(b.DueDay != nil && (*b.DueDay < 1 || *b.DueDay > 31)) {
 		fail(w, http.StatusBadRequest, "invalid bill")
+		return
+	}
+	existing, err := s.q.GetBillPaidFrom(r.Context(), store.GetBillPaidFromParams{HouseholdID: v.household, ID: id})
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		count, err := s.q.CountBills(r.Context(), v.household)
+		if err != nil {
+			internal(w, r, err)
+			return
+		}
+		if count >= maxBills {
+			fail(w, http.StatusConflict, "too many bills")
+			return
+		}
+	case err != nil:
+		internal(w, r, err)
+		return
+	case existing == 0 && paidFrom != 0:
+		// Moving a joint bill into one person's private cash account would hide it from everyone else.
+		fail(w, http.StatusConflict, "a joint bill can't become personal")
 		return
 	}
 	params := store.UpsertBillParams{
@@ -154,7 +179,8 @@ func (s *Server) setTransfer(w http.ResponseWriter, r *http.Request, v viewer) {
 		return
 	}
 	month, ok := planMonth(body.Month)
-	if body.Month == "" || !ok || body.Key == "" || len(body.Key) > 200 {
+	kind, _, _ := strings.Cut(body.Key, ":")
+	if body.Month == "" || !ok || !slices.Contains([]string{"pay", "pot", "investing", "cash"}, kind) || len(body.Key) > 200 {
 		fail(w, http.StatusBadRequest, "invalid transfer")
 		return
 	}

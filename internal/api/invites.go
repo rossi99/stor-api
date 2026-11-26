@@ -74,6 +74,10 @@ func (s *Server) joinHousehold(w http.ResponseWriter, r *http.Request, v viewer)
 	if !decode(w, r, &body) {
 		return
 	}
+	if !s.joins.allow(string(v.user.Bytes[:])) {
+		fail(w, http.StatusTooManyRequests, "too many attempts, try again shortly")
+		return
+	}
 	errNoInvite, errSame, errFull, errHasData := errors.New("no invite"), errors.New("same"), errors.New("full"), errors.New("has data")
 	err := pgx.BeginFunc(r.Context(), s.pool, func(tx pgx.Tx) error {
 		q := s.q.WithTx(tx)

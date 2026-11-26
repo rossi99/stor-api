@@ -150,7 +150,7 @@ ON CONFLICT (household_id, id) DO UPDATE SET
     name = EXCLUDED.name, group_name = EXCLUDED.group_name, kind = EXCLUDED.kind, category = EXCLUDED.category,
     amount_pence = EXCLUDED.amount_pence, frequency = EXCLUDED.frequency, months = EXCLUDED.months,
     paid_from = EXCLUDED.paid_from, due_day = EXCLUDED.due_day, meta = EXCLUDED.meta, is_estimated = EXCLUDED.is_estimated
-WHERE bills.paid_from IN (0, @viewer_slot::smallint);
+WHERE bills.paid_from IN (0, @viewer_slot::smallint) AND NOT (bills.paid_from = 0 AND EXCLUDED.paid_from <> 0);
 
 -- name: DeleteBill :execrows
 DELETE FROM bills WHERE household_id = $1 AND id = $2 AND paid_from IN (0, @viewer_slot::smallint);
@@ -163,3 +163,32 @@ INSERT INTO transfer_ticks (household_id, month, key) VALUES ($1, $2, $3) ON CON
 
 -- name: UntickTransfer :exec
 DELETE FROM transfer_ticks WHERE household_id = $1 AND month = $2 AND key = $3;
+
+-- name: GetPasswordHash :one
+SELECT password_hash FROM users WHERE id = $1;
+
+-- name: DeleteUser :exec
+DELETE FROM users WHERE id = $1;
+
+-- name: OtherAccountsInHousehold :one
+SELECT EXISTS (SELECT 1 FROM members WHERE household_id = $1 AND slot <> @slot::smallint AND user_id IS NOT NULL);
+
+-- name: DeletePersonalBills :exec
+DELETE FROM bills WHERE household_id = $1 AND paid_from = @slot::smallint;
+
+-- name: DeletePersonalTransactions :exec
+DELETE FROM transactions WHERE household_id = $1 AND ledger_slot = @slot::smallint;
+
+-- name: ForgetActorName :exec
+-- Joint spending stays with the household, without the departing member's name on it.
+UPDATE transactions SET actor_name = NULL WHERE household_id = $1 AND actor_slot = @slot::smallint;
+
+-- name: ReleaseSeat :exec
+UPDATE members SET user_id = NULL, name = '', net_pay_pence = 0, contribution_pence = 0
+WHERE household_id = $1 AND slot = @slot::smallint;
+
+-- name: GetBillPaidFrom :one
+SELECT paid_from FROM bills WHERE household_id = $1 AND id = $2;
+
+-- name: CountBills :one
+SELECT count(*) FROM bills WHERE household_id = $1;

@@ -27,14 +27,17 @@ const sessionTTL = 30 * 24 * time.Hour
 type Server struct {
 	pool *pgxpool.Pool
 	q    *store.Queries
+	// attempts limits password and invite-code guesses per client address; joins, per account.
+	attempts, joins *limiter
 }
 
 func New(pool *pgxpool.Pool) http.Handler {
-	s := &Server{pool: pool, q: store.New(pool)}
+	s := &Server{pool: pool, q: store.New(pool), attempts: newLimiter(20, 3*time.Second), joins: newLimiter(5, 10*time.Minute)}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) })
-	mux.HandleFunc("POST /auth/sign-up", s.signUp)
-	mux.HandleFunc("POST /auth/sign-in", s.signIn)
+	mux.HandleFunc("POST /auth/sign-up", s.limited(s.signUp))
+	mux.HandleFunc("POST /auth/sign-in", s.limited(s.signIn))
+	mux.HandleFunc("DELETE /auth/account", s.limited(s.authed(s.deleteAccount)))
 	mux.HandleFunc("POST /auth/sign-out", s.signOut)
 	mux.HandleFunc("GET /auth/session", s.session)
 	mux.HandleFunc("GET /household", s.authed(s.household))
@@ -47,7 +50,7 @@ func New(pool *pgxpool.Pool) http.Handler {
 	mux.HandleFunc("POST /household/setup-complete", s.authed(s.completeSetup))
 	mux.HandleFunc("PUT /household/members", s.authed(s.setMembers))
 	mux.HandleFunc("POST /household/invites", s.authed(s.createInvite))
-	mux.HandleFunc("POST /household/join", s.authed(s.joinHousehold))
+	mux.HandleFunc("POST /household/join", s.limited(s.authed(s.joinHousehold)))
 	mux.HandleFunc("PUT /household/budget", s.authed(s.setBudget))
 	mux.HandleFunc("PUT /bills/{id}", s.authed(s.putBill))
 	mux.HandleFunc("DELETE /bills/{id}", s.authed(s.deleteBill))
@@ -234,6 +237,61 @@ func (s *Server) session(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	reply(w, http.StatusOK, authSession{Email: u.Email, HasCompletedSetup: u.SetupComplete})
+}
+
+// deleteAccount removes the signed-in user after re-checking their password. Alone in the household,
+// the whole household goes; otherwise their personal bills, spending, name and pay go and the seat reopens.
+func (s *Server) deleteAccount(w http.ResponseWriter, r *http.Request, v viewer) {
+	var body struct {
+		Password string `json:"password"`
+	}
+	if !decode(w, r, &body) {
+		return
+	}
+	hash, err := s.q.GetPasswordHash(r.Context(), v.user)
+	if err != nil {
+		internal(w, r, err)
+		return
+	}
+	if !verifyPassword(body.Password, hash) {
+		fail(w, http.StatusUnauthorized, "invalid credentials")
+		return
+	}
+	err = pgx.BeginFunc(r.Context(), s.pool, func(tx pgx.Tx) error {
+		q := s.q.WithTx(tx)
+		ctx := r.Context()
+		if err := q.LockHousehold(ctx, v.household); err != nil {
+			return err
+		}
+		others, err := q.OtherAccountsInHousehold(ctx, store.OtherAccountsInHouseholdParams{HouseholdID: v.household, Slot: v.slot})
+		if err != nil {
+			return err
+		}
+		if !others {
+			if err := q.DeleteHousehold(ctx, v.household); err != nil {
+				return err
+			}
+			return q.DeleteUser(ctx, v.user)
+		}
+		if err := q.DeletePersonalBills(ctx, store.DeletePersonalBillsParams{HouseholdID: v.household, Slot: v.slot}); err != nil {
+			return err
+		}
+		if err := q.DeletePersonalTransactions(ctx, store.DeletePersonalTransactionsParams{HouseholdID: v.household, Slot: v.slot}); err != nil {
+			return err
+		}
+		if err := q.ForgetActorName(ctx, store.ForgetActorNameParams{HouseholdID: v.household, Slot: v.slot}); err != nil {
+			return err
+		}
+		if err := q.ReleaseSeat(ctx, store.ReleaseSeatParams{HouseholdID: v.household, Slot: v.slot}); err != nil {
+			return err
+		}
+		return q.DeleteUser(ctx, v.user)
+	})
+	if err != nil {
+		internal(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func bearerHash(r *http.Request) ([]byte, bool) {

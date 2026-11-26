@@ -1,12 +1,14 @@
 // Command import loads the Bills table from a CSV export of the budget sheet's Monthly Budget tab
 // into a Stór household, through the API so its validation applies.
 //
-//	STOR_PASSWORD=… go run ./cmd/import -email you@example.com -csv monthly-budget.csv
+//	go run ./cmd/import -email you@example.com -csv monthly-budget.csv
 //
-// Re-running it updates the same bills rather than adding copies.
+// It asks for the password without echoing it, so it never lands in shell history; scripts can set
+// STOR_PASSWORD instead. Re-running it updates the same bills rather than adding copies.
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/csv"
 	"encoding/json"
@@ -18,6 +20,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"slices"
 	"strconv"
 	"strings"
@@ -216,15 +219,39 @@ func run(api, email, password, path string) error {
 	return nil
 }
 
+// readPassword prompts on the terminal with echo turned off.
+func readPassword() (string, error) {
+	fmt.Fprint(os.Stderr, "Password: ")
+	stty := func(arg string) {
+		cmd := exec.Command("stty", arg)
+		cmd.Stdin = os.Stdin
+		_ = cmd.Run()
+	}
+	stty("-echo")
+	defer func() { stty("echo"); fmt.Fprintln(os.Stderr) }()
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil && line == "" {
+		return "", err
+	}
+	return strings.TrimRight(line, "\r\n"), nil
+}
+
 func main() {
 	api := flag.String("api", "http://localhost:8080", "Stór API base URL")
 	email := flag.String("email", "", "account to import into")
 	path := flag.String("csv", "", "CSV export of the Monthly Budget tab")
 	flag.Parse()
-	password := os.Getenv("STOR_PASSWORD")
-	if *email == "" || *path == "" || password == "" {
-		fmt.Fprintln(os.Stderr, "usage: STOR_PASSWORD=… import -email you@example.com -csv monthly-budget.csv [-api URL]")
+	if *email == "" || *path == "" {
+		fmt.Fprintln(os.Stderr, "usage: import -email you@example.com -csv monthly-budget.csv [-api URL]")
 		os.Exit(2)
+	}
+	password := os.Getenv("STOR_PASSWORD")
+	if password == "" {
+		var err error
+		if password, err = readPassword(); err != nil || password == "" {
+			fmt.Fprintln(os.Stderr, "import: no password given")
+			os.Exit(2)
+		}
 	}
 	if err := run(strings.TrimSuffix(*api, "/"), *email, password, *path); err != nil {
 		fmt.Fprintln(os.Stderr, "import:", err)
