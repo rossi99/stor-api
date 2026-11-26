@@ -13,6 +13,17 @@ INSERT INTO members (household_id, slot, user_id) VALUES ($1, $2, $3);
 -- name: CreateSession :exec
 INSERT INTO sessions (token_hash, user_id, expires_at) VALUES ($1, $2, $3);
 
+-- name: DeleteSession :exec
+DELETE FROM sessions WHERE token_hash = $1;
+
+-- name: GetSessionUser :one
+SELECT u.email, h.setup_complete
+FROM sessions s
+JOIN users u ON u.id = s.user_id
+JOIN members m ON m.user_id = u.id
+JOIN households h ON h.id = m.household_id
+WHERE s.token_hash = $1 AND s.expires_at > now();
+
 -- name: GetSessionMember :one
 SELECT m.household_id, m.slot,
        (SELECT count(*) FROM members o WHERE o.household_id = m.household_id)::smallint AS size

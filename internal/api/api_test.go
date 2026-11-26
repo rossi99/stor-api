@@ -120,10 +120,31 @@ func TestAuth(t *testing.T) {
 		t.Fatal("setup-complete did not persist")
 	}
 
+	restored := c.expect(200, "GET", "/auth/session", token, nil)
+	if restored["email"] != "ana@example.com" || restored["hasCompletedSetup"] != true || restored["token"] != nil {
+		t.Fatalf("restored session = %v", restored)
+	}
+	c.expect(401, "GET", "/auth/session", "", nil)
+	c.expect(401, "GET", "/auth/session", "not-a-token", nil)
+
 	if _, err := pool.Exec(context.Background(), `UPDATE sessions SET expires_at = now() - interval '1 second'`); err != nil {
 		t.Fatal(err)
 	}
 	c.expect(401, "GET", "/household", token, nil)
+	c.expect(401, "GET", "/auth/session", token, nil)
+}
+
+func TestSignOutRevokesOnlyThatToken(t *testing.T) {
+	c, _ := setup(t)
+	phone := signUp(c, "ana@example.com")
+	laptop := c.expect(200, "POST", "/auth/sign-in", "", map[string]string{"email": "ana@example.com", "password": "password-1"})["token"].(string)
+
+	c.expect(401, "POST", "/auth/sign-out", "", nil)
+	c.expect(204, "POST", "/auth/sign-out", phone, nil)
+	c.expect(204, "POST", "/auth/sign-out", phone, nil)
+	c.expect(401, "GET", "/household", phone, nil)
+	c.expect(401, "GET", "/auth/session", phone, nil)
+	c.expect(200, "GET", "/household", laptop, nil)
 }
 
 func TestNewHousehold(t *testing.T) {

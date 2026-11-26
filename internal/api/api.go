@@ -34,6 +34,8 @@ func New(pool *pgxpool.Pool) http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) })
 	mux.HandleFunc("POST /auth/sign-up", s.signUp)
 	mux.HandleFunc("POST /auth/sign-in", s.signIn)
+	mux.HandleFunc("POST /auth/sign-out", s.signOut)
+	mux.HandleFunc("GET /auth/session", s.session)
 	mux.HandleFunc("GET /household", s.authed(s.household))
 	mux.HandleFunc("POST /transactions", s.authed(s.addTransaction))
 	mux.HandleFunc("PUT /household/contributions", s.authed(s.setContributions))
@@ -96,7 +98,7 @@ type credentials struct{ Email, Password string }
 type authSession struct {
 	Email             string `json:"email"`
 	HasCompletedSetup bool   `json:"hasCompletedSetup"`
-	Token             string `json:"token"`
+	Token             string `json:"token,omitempty"`
 }
 
 func (c *credentials) normalise() bool {
@@ -191,15 +193,56 @@ func newSession(ctx context.Context, q *store.Queries, userID pgtype.UUID) (stri
 	})
 }
 
+// Revoking is idempotent: an unknown or expired token is already signed out.
+func (s *Server) signOut(w http.ResponseWriter, r *http.Request) {
+	hash, ok := bearerHash(r)
+	if !ok {
+		fail(w, http.StatusUnauthorized, "missing token")
+		return
+	}
+	if err := s.q.DeleteSession(r.Context(), hash); err != nil {
+		internal(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// session lets a relaunched app check its stored token without signing in again.
+func (s *Server) session(w http.ResponseWriter, r *http.Request) {
+	hash, ok := bearerHash(r)
+	if !ok {
+		fail(w, http.StatusUnauthorized, "missing token")
+		return
+	}
+	u, err := s.q.GetSessionUser(r.Context(), hash)
+	if errors.Is(err, pgx.ErrNoRows) {
+		fail(w, http.StatusUnauthorized, "invalid or expired token")
+		return
+	}
+	if err != nil {
+		internal(w, r, err)
+		return
+	}
+	reply(w, http.StatusOK, authSession{Email: u.Email, HasCompletedSetup: u.SetupComplete})
+}
+
+func bearerHash(r *http.Request) ([]byte, bool) {
+	token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if !ok || token == "" {
+		return nil, false
+	}
+	hash := sha256.Sum256([]byte(token))
+	return hash[:], true
+}
+
 func (s *Server) authed(next func(http.ResponseWriter, *http.Request, viewer)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if !ok || token == "" {
+		hash, ok := bearerHash(r)
+		if !ok {
 			fail(w, http.StatusUnauthorized, "missing token")
 			return
 		}
-		hash := sha256.Sum256([]byte(token))
-		m, err := s.q.GetSessionMember(r.Context(), hash[:])
+		m, err := s.q.GetSessionMember(r.Context(), hash)
 		if errors.Is(err, pgx.ErrNoRows) {
 			fail(w, http.StatusUnauthorized, "invalid or expired token")
 			return

@@ -107,6 +107,15 @@ func (q *Queries) DeleteMembersBeyond(ctx context.Context, arg DeleteMembersBeyo
 	return err
 }
 
+const deleteSession = `-- name: DeleteSession :exec
+DELETE FROM sessions WHERE token_hash = $1
+`
+
+func (q *Queries) DeleteSession(ctx context.Context, tokenHash []byte) error {
+	_, err := q.db.Exec(ctx, deleteSession, tokenHash)
+	return err
+}
+
 const getMemberByUser = `-- name: GetMemberByUser :one
 SELECT m.household_id, m.slot, h.setup_complete
 FROM members m JOIN households h ON h.id = m.household_id
@@ -144,6 +153,27 @@ func (q *Queries) GetSessionMember(ctx context.Context, tokenHash []byte) (GetSe
 	row := q.db.QueryRow(ctx, getSessionMember, tokenHash)
 	var i GetSessionMemberRow
 	err := row.Scan(&i.HouseholdID, &i.Slot, &i.Size)
+	return i, err
+}
+
+const getSessionUser = `-- name: GetSessionUser :one
+SELECT u.email, h.setup_complete
+FROM sessions s
+JOIN users u ON u.id = s.user_id
+JOIN members m ON m.user_id = u.id
+JOIN households h ON h.id = m.household_id
+WHERE s.token_hash = $1 AND s.expires_at > now()
+`
+
+type GetSessionUserRow struct {
+	Email         string
+	SetupComplete bool
+}
+
+func (q *Queries) GetSessionUser(ctx context.Context, tokenHash []byte) (GetSessionUserRow, error) {
+	row := q.db.QueryRow(ctx, getSessionUser, tokenHash)
+	var i GetSessionUserRow
+	err := row.Scan(&i.Email, &i.SetupComplete)
 	return i, err
 }
 
