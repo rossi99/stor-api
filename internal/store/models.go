@@ -8,6 +8,23 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+type Bill struct {
+	HouseholdID pgtype.UUID
+	ID          string
+	Name        string
+	GroupName   string
+	Kind        string
+	Category    string
+	AmountPence int64
+	Frequency   string
+	Months      []int16
+	PaidFrom    int16
+	DueDay      pgtype.Int2
+	Meta        string
+	IsEstimated bool
+	CreatedAt   pgtype.Timestamptz
+}
+
 type Goal struct {
 	HouseholdID  pgtype.UUID
 	ID           string
@@ -19,9 +36,14 @@ type Goal struct {
 }
 
 type Household struct {
-	ID            pgtype.UUID
-	TopUpDay      int32
-	SetupComplete bool
+	ID                  pgtype.UUID
+	TopUpDay            int32
+	SetupComplete       bool
+	EssentialPct        int32
+	DiscretionaryPct    int32
+	SavingPct           int32
+	LoanAllocationPence int64
+	CashCapPence        pgtype.Int8
 }
 
 type Invite struct {
@@ -59,6 +81,12 @@ type Transaction struct {
 	SplitPercent pgtype.Int4
 	Monogram     string
 	CreatedAt    pgtype.Timestamptz
+}
+
+type TransferTick struct {
+	HouseholdID pgtype.UUID
+	Month       pgtype.Date
+	Key         string
 }
 
 type User struct {

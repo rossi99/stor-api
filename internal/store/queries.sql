@@ -67,7 +67,8 @@ UPDATE members SET user_id = $3 WHERE household_id = $1 AND slot = $2;
 -- Joining discards the joiner's own household, so it must hold nothing and nobody else.
 SELECT NOT EXISTS (SELECT 1 FROM members m WHERE m.household_id = $1 AND m.slot <> @slot::smallint AND m.user_id IS NOT NULL)
    AND NOT EXISTS (SELECT 1 FROM transactions t WHERE t.household_id = $1)
-   AND NOT EXISTS (SELECT 1 FROM goals g WHERE g.household_id = $1);
+   AND NOT EXISTS (SELECT 1 FROM goals g WHERE g.household_id = $1)
+   AND NOT EXISTS (SELECT 1 FROM bills b WHERE b.household_id = $1);
 
 -- name: DeleteHousehold :exec
 DELETE FROM households WHERE id = $1;
@@ -115,7 +116,8 @@ SELECT id FROM households WHERE id = $1 FOR UPDATE;
 -- A member past the new size can only go if nobody signed in as them and nothing references their slot.
 SELECT EXISTS (SELECT 1 FROM members m WHERE m.household_id = $1 AND m.slot > @size::smallint AND m.user_id IS NOT NULL)
     OR EXISTS (SELECT 1 FROM transactions t WHERE t.household_id = $1
-               AND (t.ledger_slot > @size::smallint OR t.actor_slot > @size::smallint));
+               AND (t.ledger_slot > @size::smallint OR t.actor_slot > @size::smallint))
+    OR EXISTS (SELECT 1 FROM bills b WHERE b.household_id = $1 AND b.paid_from > @size::smallint);
 
 -- name: DeleteMembersBeyond :exec
 DELETE FROM members WHERE household_id = $1 AND slot > @size::smallint;
@@ -124,3 +126,40 @@ DELETE FROM members WHERE household_id = $1 AND slot > @size::smallint;
 INSERT INTO members (household_id, slot)
 SELECT $1, s::smallint FROM generate_series(1, @size::int) s
 ON CONFLICT DO NOTHING;
+
+-- name: GetBudgetSettings :one
+SELECT essential_pct, discretionary_pct, saving_pct, loan_allocation_pence, cash_cap_pence
+FROM households WHERE id = $1;
+
+-- name: SetBudgetSettings :exec
+UPDATE households SET essential_pct = $2, discretionary_pct = $3, saving_pct = $4,
+    loan_allocation_pence = $5, cash_cap_pence = $6
+WHERE id = $1;
+
+-- name: ListBills :many
+-- Every member's bills: the plan totals each cash account, and the handler drops other members' rows.
+SELECT id, name, group_name, kind, category, amount_pence, frequency, months, paid_from, due_day, meta, is_estimated
+FROM bills WHERE household_id = $1 ORDER BY created_at, id;
+
+-- name: UpsertBill :execrows
+-- The WHERE stops anyone overwriting another member's personal bill that shares the id.
+INSERT INTO bills (household_id, id, name, group_name, kind, category, amount_pence, frequency,
+    months, paid_from, due_day, meta, is_estimated)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+ON CONFLICT (household_id, id) DO UPDATE SET
+    name = EXCLUDED.name, group_name = EXCLUDED.group_name, kind = EXCLUDED.kind, category = EXCLUDED.category,
+    amount_pence = EXCLUDED.amount_pence, frequency = EXCLUDED.frequency, months = EXCLUDED.months,
+    paid_from = EXCLUDED.paid_from, due_day = EXCLUDED.due_day, meta = EXCLUDED.meta, is_estimated = EXCLUDED.is_estimated
+WHERE bills.paid_from IN (0, @viewer_slot::smallint);
+
+-- name: DeleteBill :execrows
+DELETE FROM bills WHERE household_id = $1 AND id = $2 AND paid_from IN (0, @viewer_slot::smallint);
+
+-- name: ListTicks :many
+SELECT key FROM transfer_ticks WHERE household_id = $1 AND month = $2;
+
+-- name: TickTransfer :exec
+INSERT INTO transfer_ticks (household_id, month, key) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING;
+
+-- name: UntickTransfer :exec
+DELETE FROM transfer_ticks WHERE household_id = $1 AND month = $2 AND key = $3;

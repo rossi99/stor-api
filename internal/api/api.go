@@ -48,6 +48,11 @@ func New(pool *pgxpool.Pool) http.Handler {
 	mux.HandleFunc("PUT /household/members", s.authed(s.setMembers))
 	mux.HandleFunc("POST /household/invites", s.authed(s.createInvite))
 	mux.HandleFunc("POST /household/join", s.authed(s.joinHousehold))
+	mux.HandleFunc("PUT /household/budget", s.authed(s.setBudget))
+	mux.HandleFunc("PUT /bills/{id}", s.authed(s.putBill))
+	mux.HandleFunc("DELETE /bills/{id}", s.authed(s.deleteBill))
+	mux.HandleFunc("GET /plan", s.authed(s.getPlan))
+	mux.HandleFunc("PUT /plan/transfers", s.authed(s.setTransfer))
 	return mux
 }
 
@@ -313,7 +318,6 @@ type snapshot struct {
 	Ledgers          []ledgerSummary `json:"ledgers"`
 	Transactions     []transaction   `json:"transactions"`
 	Goals            []goal          `json:"goals"`
-	Bills            []any           `json:"bills"`
 	AccountGroups    []any           `json:"accountGroups"`
 	Recaps           []any           `json:"recaps"`
 	Payslips         []any           `json:"payslips"`
@@ -331,8 +335,8 @@ func (s *Server) household(w http.ResponseWriter, r *http.Request, v viewer) {
 	}
 	snap := snapshot{
 		TopUpDay: topUpDay,
-		Members: []member{}, Transactions: []transaction{}, Goals: []goal{},
-		Bills: []any{}, AccountGroups: []any{}, Recaps: []any{}, Payslips: []any{},
+		Members:  []member{}, Transactions: []transaction{}, Goals: []goal{},
+		AccountGroups: []any{}, Recaps: []any{}, Payslips: []any{},
 		Alerts: []any{}, LinkableAccounts: []any{}, LinkedAccountIDs: []string{},
 	}
 

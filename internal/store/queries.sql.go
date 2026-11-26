@@ -108,6 +108,24 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (pgtype.
 	return id, err
 }
 
+const deleteBill = `-- name: DeleteBill :execrows
+DELETE FROM bills WHERE household_id = $1 AND id = $2 AND paid_from IN (0, $3::smallint)
+`
+
+type DeleteBillParams struct {
+	HouseholdID pgtype.UUID
+	ID          string
+	ViewerSlot  int16
+}
+
+func (q *Queries) DeleteBill(ctx context.Context, arg DeleteBillParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteBill, arg.HouseholdID, arg.ID, arg.ViewerSlot)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const deleteHousehold = `-- name: DeleteHousehold :exec
 DELETE FROM households WHERE id = $1
 `
@@ -138,6 +156,32 @@ DELETE FROM sessions WHERE token_hash = $1
 func (q *Queries) DeleteSession(ctx context.Context, tokenHash []byte) error {
 	_, err := q.db.Exec(ctx, deleteSession, tokenHash)
 	return err
+}
+
+const getBudgetSettings = `-- name: GetBudgetSettings :one
+SELECT essential_pct, discretionary_pct, saving_pct, loan_allocation_pence, cash_cap_pence
+FROM households WHERE id = $1
+`
+
+type GetBudgetSettingsRow struct {
+	EssentialPct        int32
+	DiscretionaryPct    int32
+	SavingPct           int32
+	LoanAllocationPence int64
+	CashCapPence        pgtype.Int8
+}
+
+func (q *Queries) GetBudgetSettings(ctx context.Context, id pgtype.UUID) (GetBudgetSettingsRow, error) {
+	row := q.db.QueryRow(ctx, getBudgetSettings, id)
+	var i GetBudgetSettingsRow
+	err := row.Scan(
+		&i.EssentialPct,
+		&i.DiscretionaryPct,
+		&i.SavingPct,
+		&i.LoanAllocationPence,
+		&i.CashCapPence,
+	)
+	return i, err
 }
 
 const getMemberByUser = `-- name: GetMemberByUser :one
@@ -249,6 +293,7 @@ const householdIsDisposable = `-- name: HouseholdIsDisposable :one
 SELECT NOT EXISTS (SELECT 1 FROM members m WHERE m.household_id = $1 AND m.slot <> $2::smallint AND m.user_id IS NOT NULL)
    AND NOT EXISTS (SELECT 1 FROM transactions t WHERE t.household_id = $1)
    AND NOT EXISTS (SELECT 1 FROM goals g WHERE g.household_id = $1)
+   AND NOT EXISTS (SELECT 1 FROM bills b WHERE b.household_id = $1)
 `
 
 type HouseholdIsDisposableParams struct {
@@ -302,6 +347,60 @@ func (q *Queries) InsertTransaction(ctx context.Context, arg InsertTransactionPa
 		arg.Monogram,
 	)
 	return err
+}
+
+const listBills = `-- name: ListBills :many
+SELECT id, name, group_name, kind, category, amount_pence, frequency, months, paid_from, due_day, meta, is_estimated
+FROM bills WHERE household_id = $1 ORDER BY created_at, id
+`
+
+type ListBillsRow struct {
+	ID          string
+	Name        string
+	GroupName   string
+	Kind        string
+	Category    string
+	AmountPence int64
+	Frequency   string
+	Months      []int16
+	PaidFrom    int16
+	DueDay      pgtype.Int2
+	Meta        string
+	IsEstimated bool
+}
+
+// Every member's bills: the plan totals each cash account, and the handler drops other members' rows.
+func (q *Queries) ListBills(ctx context.Context, householdID pgtype.UUID) ([]ListBillsRow, error) {
+	rows, err := q.db.Query(ctx, listBills, householdID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListBillsRow
+	for rows.Next() {
+		var i ListBillsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.GroupName,
+			&i.Kind,
+			&i.Category,
+			&i.AmountPence,
+			&i.Frequency,
+			&i.Months,
+			&i.PaidFrom,
+			&i.DueDay,
+			&i.Meta,
+			&i.IsEstimated,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listGoals = `-- name: ListGoals :many
@@ -384,6 +483,35 @@ func (q *Queries) ListMembers(ctx context.Context, householdID pgtype.UUID) ([]L
 	return items, nil
 }
 
+const listTicks = `-- name: ListTicks :many
+SELECT key FROM transfer_ticks WHERE household_id = $1 AND month = $2
+`
+
+type ListTicksParams struct {
+	HouseholdID pgtype.UUID
+	Month       pgtype.Date
+}
+
+func (q *Queries) ListTicks(ctx context.Context, arg ListTicksParams) ([]string, error) {
+	rows, err := q.db.Query(ctx, listTicks, arg.HouseholdID, arg.Month)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, err
+		}
+		items = append(items, key)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listVisibleTransactions = `-- name: ListVisibleTransactions :many
 SELECT id, occurred_at, title, category, amount_pence, actor_slot, actor_name,
        ledger_slot, tag, split_percent, monogram
@@ -457,6 +585,7 @@ const membersBeyondInUse = `-- name: MembersBeyondInUse :one
 SELECT EXISTS (SELECT 1 FROM members m WHERE m.household_id = $1 AND m.slot > $2::smallint AND m.user_id IS NOT NULL)
     OR EXISTS (SELECT 1 FROM transactions t WHERE t.household_id = $1
                AND (t.ledger_slot > $2::smallint OR t.actor_slot > $2::smallint))
+    OR EXISTS (SELECT 1 FROM bills b WHERE b.household_id = $1 AND b.paid_from > $2::smallint)
 `
 
 type MembersBeyondInUseParams struct {
@@ -481,6 +610,33 @@ func (q *Queries) OpenSeat(ctx context.Context, householdID pgtype.UUID) (int16,
 	var slot int16
 	err := row.Scan(&slot)
 	return slot, err
+}
+
+const setBudgetSettings = `-- name: SetBudgetSettings :exec
+UPDATE households SET essential_pct = $2, discretionary_pct = $3, saving_pct = $4,
+    loan_allocation_pence = $5, cash_cap_pence = $6
+WHERE id = $1
+`
+
+type SetBudgetSettingsParams struct {
+	ID                  pgtype.UUID
+	EssentialPct        int32
+	DiscretionaryPct    int32
+	SavingPct           int32
+	LoanAllocationPence int64
+	CashCapPence        pgtype.Int8
+}
+
+func (q *Queries) SetBudgetSettings(ctx context.Context, arg SetBudgetSettingsParams) error {
+	_, err := q.db.Exec(ctx, setBudgetSettings,
+		arg.ID,
+		arg.EssentialPct,
+		arg.DiscretionaryPct,
+		arg.SavingPct,
+		arg.LoanAllocationPence,
+		arg.CashCapPence,
+	)
+	return err
 }
 
 const setContribution = `-- name: SetContribution :exec
@@ -598,6 +754,88 @@ func (q *Queries) TakeInvite(ctx context.Context, codeHash []byte) (pgtype.UUID,
 	var household_id pgtype.UUID
 	err := row.Scan(&household_id)
 	return household_id, err
+}
+
+const tickTransfer = `-- name: TickTransfer :exec
+INSERT INTO transfer_ticks (household_id, month, key) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING
+`
+
+type TickTransferParams struct {
+	HouseholdID pgtype.UUID
+	Month       pgtype.Date
+	Key         string
+}
+
+func (q *Queries) TickTransfer(ctx context.Context, arg TickTransferParams) error {
+	_, err := q.db.Exec(ctx, tickTransfer, arg.HouseholdID, arg.Month, arg.Key)
+	return err
+}
+
+const untickTransfer = `-- name: UntickTransfer :exec
+DELETE FROM transfer_ticks WHERE household_id = $1 AND month = $2 AND key = $3
+`
+
+type UntickTransferParams struct {
+	HouseholdID pgtype.UUID
+	Month       pgtype.Date
+	Key         string
+}
+
+func (q *Queries) UntickTransfer(ctx context.Context, arg UntickTransferParams) error {
+	_, err := q.db.Exec(ctx, untickTransfer, arg.HouseholdID, arg.Month, arg.Key)
+	return err
+}
+
+const upsertBill = `-- name: UpsertBill :execrows
+INSERT INTO bills (household_id, id, name, group_name, kind, category, amount_pence, frequency,
+    months, paid_from, due_day, meta, is_estimated)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+ON CONFLICT (household_id, id) DO UPDATE SET
+    name = EXCLUDED.name, group_name = EXCLUDED.group_name, kind = EXCLUDED.kind, category = EXCLUDED.category,
+    amount_pence = EXCLUDED.amount_pence, frequency = EXCLUDED.frequency, months = EXCLUDED.months,
+    paid_from = EXCLUDED.paid_from, due_day = EXCLUDED.due_day, meta = EXCLUDED.meta, is_estimated = EXCLUDED.is_estimated
+WHERE bills.paid_from IN (0, $14::smallint)
+`
+
+type UpsertBillParams struct {
+	HouseholdID pgtype.UUID
+	ID          string
+	Name        string
+	GroupName   string
+	Kind        string
+	Category    string
+	AmountPence int64
+	Frequency   string
+	Months      []int16
+	PaidFrom    int16
+	DueDay      pgtype.Int2
+	Meta        string
+	IsEstimated bool
+	ViewerSlot  int16
+}
+
+// The WHERE stops anyone overwriting another member's personal bill that shares the id.
+func (q *Queries) UpsertBill(ctx context.Context, arg UpsertBillParams) (int64, error) {
+	result, err := q.db.Exec(ctx, upsertBill,
+		arg.HouseholdID,
+		arg.ID,
+		arg.Name,
+		arg.GroupName,
+		arg.Kind,
+		arg.Category,
+		arg.AmountPence,
+		arg.Frequency,
+		arg.Months,
+		arg.PaidFrom,
+		arg.DueDay,
+		arg.Meta,
+		arg.IsEstimated,
+		arg.ViewerSlot,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const upsertInvite = `-- name: UpsertInvite :exec

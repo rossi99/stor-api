@@ -159,12 +159,13 @@ func TestNewHousehold(t *testing.T) {
 	defer res.Body.Close()
 	raw, _ := io.ReadAll(res.Body)
 	body := string(raw)
-	for _, key := range []string{`"bills":[]`, `"recaps":[]`, `"linkedAccountIDs":[]`, `"transactions":[]`, `"goals":[]`} {
+	for _, key := range []string{`"recaps":[]`, `"linkedAccountIDs":[]`, `"transactions":[]`, `"goals":[]`} {
 		if !strings.Contains(body, key) {
 			t.Errorf("missing %s in %s", key, body)
 		}
 	}
-	if strings.Contains(body, "netWorth") || strings.Contains(body, "emergencyFund") {
+	// Bills live in the plan now.
+	if strings.Contains(body, "netWorth") || strings.Contains(body, "emergencyFund") || strings.Contains(body, `"bills"`) {
 		t.Errorf("unknown optionals should be omitted: %s", body)
 	}
 	var snap struct{ Members []member }
