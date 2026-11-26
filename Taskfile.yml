@@ -1,0 +1,34 @@
+version: '3'
+
+vars:
+  DATABASE_URL: postgres://stor:stor_dev_password@localhost:5433/stor?sslmode=disable
+  TEST_DATABASE_URL: postgres://stor:stor_dev_password@localhost:5433/stor_test?sslmode=disable
+
+tasks:
+  db-up:
+    desc: Start Postgres
+    cmd: docker compose up -d db --wait
+
+  run:
+    desc: Run the API on :8080 (migrates on start)
+    deps: [db-up]
+    env:
+      DATABASE_URL: '{{.DATABASE_URL}}'
+    cmd: go run ./cmd/stor
+
+  sqlc:
+    desc: Regenerate the store package
+    cmd: sqlc generate
+
+  vet:
+    desc: Static checks
+    cmds:
+      - go vet ./...
+      - sqlc vet
+
+  test:
+    desc: Run all tests against the compose Postgres
+    deps: [db-up]
+    env:
+      TEST_DATABASE_URL: '{{.TEST_DATABASE_URL}}'
+    cmd: go test -count=1 ./...

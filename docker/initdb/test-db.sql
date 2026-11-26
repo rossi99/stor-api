@@ -1,0 +1,1 @@
+CREATE DATABASE stor_test;
