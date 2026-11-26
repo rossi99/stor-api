@@ -24,11 +24,19 @@ type Household struct {
 	SetupComplete bool
 }
 
+type Invite struct {
+	HouseholdID pgtype.UUID
+	CodeHash    []byte
+	ExpiresAt   pgtype.Timestamptz
+}
+
 type Member struct {
 	HouseholdID       pgtype.UUID
 	Slot              int16
 	UserID            pgtype.UUID
 	ContributionPence int64
+	Name              string
+	NetPayPence       int64
 }
 
 type Session struct {

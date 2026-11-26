@@ -195,14 +195,7 @@ func TestTransactionsIdempotentAndPrivate(t *testing.T) {
 	ctx := context.Background()
 	ana := signUp(c, "ana@example.com")
 	sam := signUp(c, "sam@example.com")
-	// No join endpoint exists yet, so move Sam into Ana's household as the second member.
-	_, err := pool.Exec(ctx, `
-		WITH ana AS (SELECT m.household_id FROM members m JOIN users u ON u.id = m.user_id WHERE u.email = 'ana@example.com'),
-		     sam AS (DELETE FROM members WHERE user_id = (SELECT id FROM users WHERE email = 'sam@example.com') RETURNING user_id)
-		UPDATE members SET user_id = (SELECT user_id FROM sam) WHERE household_id = (SELECT household_id FROM ana) AND slot = 2`)
-	if err != nil {
-		t.Fatal(err)
-	}
+	join(c, sam, invite(c, ana))
 
 	c.expect(204, "POST", "/transactions", ana, txn("a-own", "you", -12.5))
 	c.expect(204, "POST", "/transactions", ana, txn("a-own", "you", -12.5))

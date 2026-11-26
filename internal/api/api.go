@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -44,6 +45,9 @@ func New(pool *pgxpool.Pool) http.Handler {
 	mux.HandleFunc("PUT /household/top-up-day", s.authed(s.setTopUpDay))
 	mux.HandleFunc("PUT /household/size", s.authed(s.setHouseholdSize))
 	mux.HandleFunc("POST /household/setup-complete", s.authed(s.completeSetup))
+	mux.HandleFunc("PUT /household/members", s.authed(s.setMembers))
+	mux.HandleFunc("POST /household/invites", s.authed(s.createInvite))
+	mux.HandleFunc("POST /household/join", s.authed(s.joinHousehold))
 	return mux
 }
 
@@ -52,6 +56,7 @@ const maxMembers = 4
 // viewer is the signed-in member; slot is their absolute ledger slot (1 to size).
 type viewer struct {
 	household pgtype.UUID
+	user      pgtype.UUID
 	slot      int16
 	size      int16
 }
@@ -251,7 +256,7 @@ func (s *Server) authed(next func(http.ResponseWriter, *http.Request, viewer)) h
 			internal(w, r, err)
 			return
 		}
-		next(w, r, viewer{household: m.HouseholdID, slot: m.Slot, size: m.Size})
+		next(w, r, viewer{household: m.HouseholdID, user: m.UserID, slot: m.Slot, size: m.Size})
 	}
 }
 
@@ -264,6 +269,7 @@ type member struct {
 	Role         string  `json:"role"`
 	NetPay       float64 `json:"netPay"`
 	Contribution float64 `json:"contribution"`
+	HasAccount   bool    `json:"hasAccount"`
 }
 
 type ledgerSummary struct {
@@ -298,7 +304,7 @@ type goal struct {
 	Note    string  `json:"note"`
 }
 
-// shortcut: nothing sets names, roles or net pay yet, so they go out as "" and 0; add columns when an endpoint writes them.
+// shortcut: nothing sets roles yet, so they go out as ""; add a column when an endpoint writes them.
 // averageSharedOutgoings, emergencyFund and netWorth are omitted until there is data behind them.
 type snapshot struct {
 	Name             string          `json:"name"`
@@ -337,7 +343,10 @@ func (s *Server) household(w http.ResponseWriter, r *http.Request, v viewer) {
 	}
 	// The viewer first, then everyone else in slot order.
 	for _, m := range members {
-		out := member{Ledger: v.ledgerFor(m.Slot), Contribution: pounds(m.ContributionPence)}
+		out := member{
+			Ledger: v.ledgerFor(m.Slot), Name: m.Name, Initials: initials(m.Name), NetPay: pounds(m.NetPayPence),
+			Contribution: pounds(m.ContributionPence), HasAccount: m.HasAccount,
+		}
 		if m.Slot == v.slot {
 			snap.Members = append([]member{out}, snap.Members...)
 		} else {
@@ -477,6 +486,55 @@ func (s *Server) setContributions(w http.ResponseWriter, r *http.Request, v view
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// Any member may name anyone and set their pay, as in a shared budget sheet; pay is visible to the household anyway.
+func (s *Server) setMembers(w http.ResponseWriter, r *http.Request, v viewer) {
+	var body []struct {
+		Ledger string  `json:"ledger"`
+		Name   string  `json:"name"`
+		NetPay float64 `json:"netPay"`
+	}
+	if !decode(w, r, &body) {
+		return
+	}
+	updates := make([]store.SetMemberProfileParams, 0, len(body))
+	for _, m := range body {
+		slot, ok := v.slotFor(m.Ledger)
+		pay, payOK := pence(m.NetPay)
+		name := strings.TrimSpace(m.Name)
+		if !ok || slot == 0 || !payOK || pay < 0 || utf8.RuneCountInString(name) > 60 {
+			fail(w, http.StatusBadRequest, "invalid member")
+			return
+		}
+		updates = append(updates, store.SetMemberProfileParams{HouseholdID: v.household, Slot: slot, Name: name, NetPayPence: pay})
+	}
+	err := pgx.BeginFunc(r.Context(), s.pool, func(tx pgx.Tx) error {
+		for _, u := range updates {
+			if err := s.q.WithTx(tx).SetMemberProfile(r.Context(), u); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		internal(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// initials takes the first letter of the first and last names: "Ana María Ruiz" is "AR".
+func initials(name string) string {
+	words := strings.Fields(name)
+	if len(words) == 0 {
+		return ""
+	}
+	first := string([]rune(words[0])[:1])
+	if len(words) == 1 {
+		return strings.ToUpper(first)
+	}
+	return strings.ToUpper(first + string([]rune(words[len(words)-1])[:1]))
 }
 
 func (s *Server) setGoalMonthly(w http.ResponseWriter, r *http.Request, v viewer) {

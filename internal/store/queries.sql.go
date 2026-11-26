@@ -27,6 +27,21 @@ func (q *Queries) AddMembersUpTo(ctx context.Context, arg AddMembersUpToParams) 
 	return err
 }
 
+const claimSeat = `-- name: ClaimSeat :exec
+UPDATE members SET user_id = $3 WHERE household_id = $1 AND slot = $2
+`
+
+type ClaimSeatParams struct {
+	HouseholdID pgtype.UUID
+	Slot        int16
+	UserID      pgtype.UUID
+}
+
+func (q *Queries) ClaimSeat(ctx context.Context, arg ClaimSeatParams) error {
+	_, err := q.db.Exec(ctx, claimSeat, arg.HouseholdID, arg.Slot, arg.UserID)
+	return err
+}
+
 const completeSetup = `-- name: CompleteSetup :exec
 UPDATE households SET setup_complete = true WHERE id = $1
 `
@@ -93,6 +108,15 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (pgtype.
 	return id, err
 }
 
+const deleteHousehold = `-- name: DeleteHousehold :exec
+DELETE FROM households WHERE id = $1
+`
+
+func (q *Queries) DeleteHousehold(ctx context.Context, id pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, deleteHousehold, id)
+	return err
+}
+
 const deleteMembersBeyond = `-- name: DeleteMembersBeyond :exec
 DELETE FROM members WHERE household_id = $1 AND slot > $2::smallint
 `
@@ -136,7 +160,7 @@ func (q *Queries) GetMemberByUser(ctx context.Context, userID pgtype.UUID) (GetM
 }
 
 const getSessionMember = `-- name: GetSessionMember :one
-SELECT m.household_id, m.slot,
+SELECT m.household_id, m.slot, s.user_id,
        (SELECT count(*) FROM members o WHERE o.household_id = m.household_id)::smallint AS size
 FROM sessions s
 JOIN members m ON m.user_id = s.user_id
@@ -146,13 +170,19 @@ WHERE s.token_hash = $1 AND s.expires_at > now()
 type GetSessionMemberRow struct {
 	HouseholdID pgtype.UUID
 	Slot        int16
+	UserID      pgtype.UUID
 	Size        int16
 }
 
 func (q *Queries) GetSessionMember(ctx context.Context, tokenHash []byte) (GetSessionMemberRow, error) {
 	row := q.db.QueryRow(ctx, getSessionMember, tokenHash)
 	var i GetSessionMemberRow
-	err := row.Scan(&i.HouseholdID, &i.Slot, &i.Size)
+	err := row.Scan(
+		&i.HouseholdID,
+		&i.Slot,
+		&i.UserID,
+		&i.Size,
+	)
 	return i, err
 }
 
@@ -202,6 +232,36 @@ func (q *Queries) GetUserByEmail(ctx context.Context, email string) (GetUserByEm
 	var i GetUserByEmailRow
 	err := row.Scan(&i.ID, &i.PasswordHash)
 	return i, err
+}
+
+const hasOpenSeat = `-- name: HasOpenSeat :one
+SELECT EXISTS (SELECT 1 FROM members WHERE household_id = $1 AND user_id IS NULL)
+`
+
+func (q *Queries) HasOpenSeat(ctx context.Context, householdID pgtype.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, hasOpenSeat, householdID)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
+const householdIsDisposable = `-- name: HouseholdIsDisposable :one
+SELECT NOT EXISTS (SELECT 1 FROM members m WHERE m.household_id = $1 AND m.slot <> $2::smallint AND m.user_id IS NOT NULL)
+   AND NOT EXISTS (SELECT 1 FROM transactions t WHERE t.household_id = $1)
+   AND NOT EXISTS (SELECT 1 FROM goals g WHERE g.household_id = $1)
+`
+
+type HouseholdIsDisposableParams struct {
+	HouseholdID pgtype.UUID
+	Slot        int16
+}
+
+// Joining discards the joiner's own household, so it must hold nothing and nobody else.
+func (q *Queries) HouseholdIsDisposable(ctx context.Context, arg HouseholdIsDisposableParams) (pgtype.Bool, error) {
+	row := q.db.QueryRow(ctx, householdIsDisposable, arg.HouseholdID, arg.Slot)
+	var column_1 pgtype.Bool
+	err := row.Scan(&column_1)
+	return column_1, err
 }
 
 const insertTransaction = `-- name: InsertTransaction :exec
@@ -286,13 +346,16 @@ func (q *Queries) ListGoals(ctx context.Context, householdID pgtype.UUID) ([]Lis
 }
 
 const listMembers = `-- name: ListMembers :many
-SELECT slot, contribution_pence
+SELECT slot, contribution_pence, name, net_pay_pence, (user_id IS NOT NULL)::bool AS has_account
 FROM members WHERE household_id = $1 ORDER BY slot
 `
 
 type ListMembersRow struct {
 	Slot              int16
 	ContributionPence int64
+	Name              string
+	NetPayPence       int64
+	HasAccount        bool
 }
 
 func (q *Queries) ListMembers(ctx context.Context, householdID pgtype.UUID) ([]ListMembersRow, error) {
@@ -304,7 +367,13 @@ func (q *Queries) ListMembers(ctx context.Context, householdID pgtype.UUID) ([]L
 	var items []ListMembersRow
 	for rows.Next() {
 		var i ListMembersRow
-		if err := rows.Scan(&i.Slot, &i.ContributionPence); err != nil {
+		if err := rows.Scan(
+			&i.Slot,
+			&i.ContributionPence,
+			&i.Name,
+			&i.NetPayPence,
+			&i.HasAccount,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -403,6 +472,17 @@ func (q *Queries) MembersBeyondInUse(ctx context.Context, arg MembersBeyondInUse
 	return column_1, err
 }
 
+const openSeat = `-- name: OpenSeat :one
+SELECT slot FROM members WHERE household_id = $1 AND user_id IS NULL ORDER BY slot LIMIT 1 FOR UPDATE
+`
+
+func (q *Queries) OpenSeat(ctx context.Context, householdID pgtype.UUID) (int16, error) {
+	row := q.db.QueryRow(ctx, openSeat, householdID)
+	var slot int16
+	err := row.Scan(&slot)
+	return slot, err
+}
+
 const setContribution = `-- name: SetContribution :exec
 UPDATE members SET contribution_pence = $3 WHERE household_id = $1 AND slot = $2
 `
@@ -434,6 +514,27 @@ func (q *Queries) SetGoalMonthly(ctx context.Context, arg SetGoalMonthlyParams) 
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const setMemberProfile = `-- name: SetMemberProfile :exec
+UPDATE members SET name = $3, net_pay_pence = $4 WHERE household_id = $1 AND slot = $2
+`
+
+type SetMemberProfileParams struct {
+	HouseholdID pgtype.UUID
+	Slot        int16
+	Name        string
+	NetPayPence int64
+}
+
+func (q *Queries) SetMemberProfile(ctx context.Context, arg SetMemberProfileParams) error {
+	_, err := q.db.Exec(ctx, setMemberProfile,
+		arg.HouseholdID,
+		arg.Slot,
+		arg.Name,
+		arg.NetPayPence,
+	)
+	return err
 }
 
 const setTopUpDay = `-- name: SetTopUpDay :exec
@@ -485,4 +586,32 @@ func (q *Queries) SpentByLedger(ctx context.Context, arg SpentByLedgerParams) ([
 		return nil, err
 	}
 	return items, nil
+}
+
+const takeInvite = `-- name: TakeInvite :one
+DELETE FROM invites WHERE code_hash = $1 AND expires_at > now() RETURNING household_id
+`
+
+// Deleting on read makes a code single-use; a failed join rolls the delete back.
+func (q *Queries) TakeInvite(ctx context.Context, codeHash []byte) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, takeInvite, codeHash)
+	var household_id pgtype.UUID
+	err := row.Scan(&household_id)
+	return household_id, err
+}
+
+const upsertInvite = `-- name: UpsertInvite :exec
+INSERT INTO invites (household_id, code_hash, expires_at) VALUES ($1, $2, $3)
+ON CONFLICT (household_id) DO UPDATE SET code_hash = EXCLUDED.code_hash, expires_at = EXCLUDED.expires_at
+`
+
+type UpsertInviteParams struct {
+	HouseholdID pgtype.UUID
+	CodeHash    []byte
+	ExpiresAt   pgtype.Timestamptz
+}
+
+func (q *Queries) UpsertInvite(ctx context.Context, arg UpsertInviteParams) error {
+	_, err := q.db.Exec(ctx, upsertInvite, arg.HouseholdID, arg.CodeHash, arg.ExpiresAt)
+	return err
 }

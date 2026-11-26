@@ -25,7 +25,7 @@ JOIN households h ON h.id = m.household_id
 WHERE s.token_hash = $1 AND s.expires_at > now();
 
 -- name: GetSessionMember :one
-SELECT m.household_id, m.slot,
+SELECT m.household_id, m.slot, s.user_id,
        (SELECT count(*) FROM members o WHERE o.household_id = m.household_id)::smallint AS size
 FROM sessions s
 JOIN members m ON m.user_id = s.user_id
@@ -40,8 +40,37 @@ WHERE m.user_id = $1;
 SELECT top_up_day FROM households WHERE id = $1;
 
 -- name: ListMembers :many
-SELECT slot, contribution_pence
+SELECT slot, contribution_pence, name, net_pay_pence, (user_id IS NOT NULL)::bool AS has_account
 FROM members WHERE household_id = $1 ORDER BY slot;
+
+-- name: SetMemberProfile :exec
+UPDATE members SET name = $3, net_pay_pence = $4 WHERE household_id = $1 AND slot = $2;
+
+-- name: HasOpenSeat :one
+SELECT EXISTS (SELECT 1 FROM members WHERE household_id = $1 AND user_id IS NULL);
+
+-- name: UpsertInvite :exec
+INSERT INTO invites (household_id, code_hash, expires_at) VALUES ($1, $2, $3)
+ON CONFLICT (household_id) DO UPDATE SET code_hash = EXCLUDED.code_hash, expires_at = EXCLUDED.expires_at;
+
+-- name: TakeInvite :one
+-- Deleting on read makes a code single-use; a failed join rolls the delete back.
+DELETE FROM invites WHERE code_hash = $1 AND expires_at > now() RETURNING household_id;
+
+-- name: OpenSeat :one
+SELECT slot FROM members WHERE household_id = $1 AND user_id IS NULL ORDER BY slot LIMIT 1 FOR UPDATE;
+
+-- name: ClaimSeat :exec
+UPDATE members SET user_id = $3 WHERE household_id = $1 AND slot = $2;
+
+-- name: HouseholdIsDisposable :one
+-- Joining discards the joiner's own household, so it must hold nothing and nobody else.
+SELECT NOT EXISTS (SELECT 1 FROM members m WHERE m.household_id = $1 AND m.slot <> @slot::smallint AND m.user_id IS NOT NULL)
+   AND NOT EXISTS (SELECT 1 FROM transactions t WHERE t.household_id = $1)
+   AND NOT EXISTS (SELECT 1 FROM goals g WHERE g.household_id = $1);
+
+-- name: DeleteHousehold :exec
+DELETE FROM households WHERE id = $1;
 
 -- name: ListVisibleTransactions :many
 -- Server-side privacy: other members' personal ledgers never leave the database.
