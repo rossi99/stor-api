@@ -139,5 +139,5 @@ func (s *Server) joinHousehold(w http.ResponseWriter, r *http.Request, v viewer)
 		internal(w, r, err)
 		return
 	}
-	reply(w, http.StatusOK, authSession{Email: u.Email, HasCompletedSetup: u.SetupComplete})
+	reply(w, http.StatusOK, authSession{Email: u.Email, HasCompletedSetup: u.SetupComplete, Method: u.Method})
 }

@@ -73,6 +73,21 @@ func (q *Queries) CreateHousehold(ctx context.Context) (pgtype.UUID, error) {
 	return id, err
 }
 
+const createIdentity = `-- name: CreateIdentity :exec
+INSERT INTO identities (provider, subject, user_id) VALUES ($1, $2, $3)
+`
+
+type CreateIdentityParams struct {
+	Provider string
+	Subject  string
+	UserID   pgtype.UUID
+}
+
+func (q *Queries) CreateIdentity(ctx context.Context, arg CreateIdentityParams) error {
+	_, err := q.db.Exec(ctx, createIdentity, arg.Provider, arg.Subject, arg.UserID)
+	return err
+}
+
 const createMember = `-- name: CreateMember :exec
 INSERT INTO members (household_id, slot, user_id) VALUES ($1, $2, $3)
 `
@@ -109,7 +124,7 @@ INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id
 
 type CreateUserParams struct {
 	Email        string
-	PasswordHash string
+	PasswordHash pgtype.Text
 }
 
 func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (pgtype.UUID, error) {
@@ -263,6 +278,23 @@ func (q *Queries) GetBudgetSettings(ctx context.Context, id pgtype.UUID) (GetBud
 	return i, err
 }
 
+const getCredentials = `-- name: GetCredentials :one
+SELECT u.password_hash, i.provider, i.subject FROM users u LEFT JOIN identities i ON i.user_id = u.id WHERE u.id = $1
+`
+
+type GetCredentialsRow struct {
+	PasswordHash pgtype.Text
+	Provider     pgtype.Text
+	Subject      pgtype.Text
+}
+
+func (q *Queries) GetCredentials(ctx context.Context, id pgtype.UUID) (GetCredentialsRow, error) {
+	row := q.db.QueryRow(ctx, getCredentials, id)
+	var i GetCredentialsRow
+	err := row.Scan(&i.PasswordHash, &i.Provider, &i.Subject)
+	return i, err
+}
+
 const getMemberByUser = `-- name: GetMemberByUser :one
 SELECT m.household_id, m.slot, h.setup_complete
 FROM members m JOIN households h ON h.id = m.household_id
@@ -280,17 +312,6 @@ func (q *Queries) GetMemberByUser(ctx context.Context, userID pgtype.UUID) (GetM
 	var i GetMemberByUserRow
 	err := row.Scan(&i.HouseholdID, &i.Slot, &i.SetupComplete)
 	return i, err
-}
-
-const getPasswordHash = `-- name: GetPasswordHash :one
-SELECT password_hash FROM users WHERE id = $1
-`
-
-func (q *Queries) GetPasswordHash(ctx context.Context, id pgtype.UUID) (string, error) {
-	row := q.db.QueryRow(ctx, getPasswordHash, id)
-	var password_hash string
-	err := row.Scan(&password_hash)
-	return password_hash, err
 }
 
 const getSessionMember = `-- name: GetSessionMember :one
@@ -321,9 +342,10 @@ func (q *Queries) GetSessionMember(ctx context.Context, tokenHash []byte) (GetSe
 }
 
 const getSessionUser = `-- name: GetSessionUser :one
-SELECT u.email, h.setup_complete
+SELECT u.email, h.setup_complete, coalesce(i.provider, 'password')::text AS method
 FROM sessions s
 JOIN users u ON u.id = s.user_id
+LEFT JOIN identities i ON i.user_id = u.id
 JOIN members m ON m.user_id = u.id
 JOIN households h ON h.id = m.household_id
 WHERE s.token_hash = $1 AND s.expires_at > now()
@@ -332,12 +354,13 @@ WHERE s.token_hash = $1 AND s.expires_at > now()
 type GetSessionUserRow struct {
 	Email         string
 	SetupComplete bool
+	Method        string
 }
 
 func (q *Queries) GetSessionUser(ctx context.Context, tokenHash []byte) (GetSessionUserRow, error) {
 	row := q.db.QueryRow(ctx, getSessionUser, tokenHash)
 	var i GetSessionUserRow
-	err := row.Scan(&i.Email, &i.SetupComplete)
+	err := row.Scan(&i.Email, &i.SetupComplete, &i.Method)
 	return i, err
 }
 
@@ -358,13 +381,34 @@ SELECT id, password_hash FROM users WHERE email = $1
 
 type GetUserByEmailRow struct {
 	ID           pgtype.UUID
-	PasswordHash string
+	PasswordHash pgtype.Text
 }
 
 func (q *Queries) GetUserByEmail(ctx context.Context, email string) (GetUserByEmailRow, error) {
 	row := q.db.QueryRow(ctx, getUserByEmail, email)
 	var i GetUserByEmailRow
 	err := row.Scan(&i.ID, &i.PasswordHash)
+	return i, err
+}
+
+const getUserByIdentity = `-- name: GetUserByIdentity :one
+SELECT u.id, u.email FROM identities i JOIN users u ON u.id = i.user_id WHERE i.provider = $1 AND i.subject = $2
+`
+
+type GetUserByIdentityParams struct {
+	Provider string
+	Subject  string
+}
+
+type GetUserByIdentityRow struct {
+	ID    pgtype.UUID
+	Email string
+}
+
+func (q *Queries) GetUserByIdentity(ctx context.Context, arg GetUserByIdentityParams) (GetUserByIdentityRow, error) {
+	row := q.db.QueryRow(ctx, getUserByIdentity, arg.Provider, arg.Subject)
+	var i GetUserByIdentityRow
+	err := row.Scan(&i.ID, &i.Email)
 	return i, err
 }
 

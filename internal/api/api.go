@@ -1,7 +1,9 @@
 package api
 
 import (
+	"cmp"
 	"context"
+	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -29,14 +31,40 @@ type Server struct {
 	q    *store.Queries
 	// attempts limits password and invite-code guesses per client address; joins, per account.
 	attempts, joins *limiter
+	// providers verifies Apple and Google ID tokens, keyed by provider; one not configured is absent.
+	providers map[string]*verifier
+	apple     *appleRevoker
 }
 
-func New(pool *pgxpool.Pool) http.Handler {
-	s := &Server{pool: pool, q: store.New(pool), attempts: newLimiter(20, 3*time.Second), joins: newLimiter(5, 10*time.Minute)}
+// Config turns on Apple and Google sign-in; Apple deletions also revoke the grant when AppleKey is set.
+type Config struct {
+	GoogleClientID                         string
+	AppleBundleID, AppleTeamID, AppleKeyID string
+	AppleKey                               *ecdsa.PrivateKey
+	// Tests point these at a fake provider.
+	googleKeysURL, appleURL string
+}
+
+func New(pool *pgxpool.Pool, cfg Config) http.Handler {
+	s := &Server{pool: pool, q: store.New(pool), attempts: newLimiter(20, 3*time.Second), joins: newLimiter(5, 10*time.Minute),
+		providers: map[string]*verifier{}}
+	client := &http.Client{Timeout: 10 * time.Second}
+	if cfg.GoogleClientID != "" {
+		s.providers["google"] = &verifier{keysURL: cmp.Or(cfg.googleKeysURL, "https://www.googleapis.com/oauth2/v3/certs"),
+			issuers: []string{"accounts.google.com", "https://accounts.google.com"}, audience: cfg.GoogleClientID, client: client}
+	}
+	if cfg.AppleBundleID != "" {
+		base := cmp.Or(cfg.appleURL, appleURL)
+		s.providers["apple"] = &verifier{keysURL: base + "/auth/keys", issuers: []string{appleURL}, audience: cfg.AppleBundleID, client: client}
+		if cfg.AppleKey != nil {
+			s.apple = &appleRevoker{baseURL: base, clientID: cfg.AppleBundleID, teamID: cfg.AppleTeamID, keyID: cfg.AppleKeyID, key: cfg.AppleKey, client: client}
+		}
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) })
 	mux.HandleFunc("POST /auth/sign-up", s.limited(s.signUp))
 	mux.HandleFunc("POST /auth/sign-in", s.limited(s.signIn))
+	mux.HandleFunc("POST /auth/provider", s.limited(s.providerSignIn))
 	mux.HandleFunc("DELETE /auth/account", s.limited(s.authed(s.deleteAccount)))
 	mux.HandleFunc("POST /auth/sign-out", s.signOut)
 	mux.HandleFunc("GET /auth/session", s.session)
@@ -112,6 +140,8 @@ type authSession struct {
 	Email             string `json:"email"`
 	HasCompletedSetup bool   `json:"hasCompletedSetup"`
 	Token             string `json:"token,omitempty"`
+	// Method is "password", "apple" or "google": how the account signs in and re-confirms deletion.
+	Method string `json:"method"`
 }
 
 func (c *credentials) normalise() bool {
@@ -134,28 +164,8 @@ func (s *Server) signUp(w http.ResponseWriter, r *http.Request) {
 		internal(w, r, err)
 		return
 	}
-	var token string
-	err = pgx.BeginFunc(r.Context(), s.pool, func(tx pgx.Tx) error {
-		q := s.q.WithTx(tx)
-		userID, err := q.CreateUser(r.Context(), store.CreateUserParams{Email: c.Email, PasswordHash: hash})
-		if err != nil {
-			return err
-		}
-		household, err := q.CreateHousehold(r.Context())
-		if err != nil {
-			return err
-		}
-		if err := q.CreateMember(r.Context(), store.CreateMemberParams{HouseholdID: household, Slot: 1, UserID: userID}); err != nil {
-			return err
-		}
-		if err := q.CreateMember(r.Context(), store.CreateMemberParams{HouseholdID: household, Slot: 2}); err != nil {
-			return err
-		}
-		token, err = newSession(r.Context(), q, userID)
-		return err
-	})
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "users_email_key" {
+	token, err := s.createAccount(r.Context(), c.Email, pgtype.Text{String: hash, Valid: true}, nil)
+	if emailTaken(err) {
 		fail(w, http.StatusConflict, "email taken")
 		return
 	}
@@ -163,7 +173,43 @@ func (s *Server) signUp(w http.ResponseWriter, r *http.Request) {
 		internal(w, r, err)
 		return
 	}
-	reply(w, http.StatusCreated, authSession{Email: c.Email, Token: token})
+	reply(w, http.StatusCreated, authSession{Email: c.Email, Token: token, Method: "password"})
+}
+
+// createAccount makes a user in a new two-seat household and signs them in; Apple and Google users have no hash.
+func (s *Server) createAccount(ctx context.Context, email string, hash pgtype.Text, id *store.CreateIdentityParams) (string, error) {
+	var token string
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		q := s.q.WithTx(tx)
+		userID, err := q.CreateUser(ctx, store.CreateUserParams{Email: email, PasswordHash: hash})
+		if err != nil {
+			return err
+		}
+		if id != nil {
+			id.UserID = userID
+			if err := q.CreateIdentity(ctx, *id); err != nil {
+				return err
+			}
+		}
+		household, err := q.CreateHousehold(ctx)
+		if err != nil {
+			return err
+		}
+		if err := q.CreateMember(ctx, store.CreateMemberParams{HouseholdID: household, Slot: 1, UserID: userID}); err != nil {
+			return err
+		}
+		if err := q.CreateMember(ctx, store.CreateMemberParams{HouseholdID: household, Slot: 2}); err != nil {
+			return err
+		}
+		token, err = newSession(ctx, q, userID)
+		return err
+	})
+	return token, err
+}
+
+func emailTaken(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "users_email_key"
 }
 
 func (s *Server) signIn(w http.ResponseWriter, r *http.Request) {
@@ -173,7 +219,8 @@ func (s *Server) signIn(w http.ResponseWriter, r *http.Request) {
 	}
 	c.normalise()
 	user, err := s.q.GetUserByEmail(r.Context(), c.Email)
-	if errors.Is(err, pgx.ErrNoRows) || (err == nil && !verifyPassword(c.Password, user.PasswordHash)) {
+	// Apple and Google accounts have a NULL hash, which never verifies.
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && !verifyPassword(c.Password, user.PasswordHash.String)) {
 		fail(w, http.StatusUnauthorized, "invalid credentials")
 		return
 	}
@@ -181,17 +228,81 @@ func (s *Server) signIn(w http.ResponseWriter, r *http.Request) {
 		internal(w, r, err)
 		return
 	}
-	member, err := s.q.GetMemberByUser(r.Context(), user.ID)
+	s.openSession(w, r, user.ID, authSession{Email: c.Email, Method: "password"})
+}
+
+// providerSignIn signs in with an Apple or Google ID token, creating the account on first use.
+// An email that already has an account gets 409: sign-up never verifies emails, so linking could hand someone else's account over.
+func (s *Server) providerSignIn(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Provider string `json:"provider"`
+		IDToken  string `json:"idToken"`
+	}
+	if !decode(w, r, &body) {
+		return
+	}
+	id, ok := s.verifyIdentity(w, r, body.Provider, body.IDToken)
+	if !ok {
+		return
+	}
+	user, err := s.q.GetUserByIdentity(r.Context(), store.GetUserByIdentityParams{Provider: body.Provider, Subject: id.subject})
+	if err == nil {
+		s.openSession(w, r, user.ID, authSession{Email: user.Email, Method: body.Provider})
+		return
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		internal(w, r, err)
+		return
+	}
+	if id.email == "" || !id.emailVerified {
+		fail(w, http.StatusBadRequest, "verified email required")
+		return
+	}
+	token, err := s.createAccount(r.Context(), id.email, pgtype.Text{}, &store.CreateIdentityParams{Provider: body.Provider, Subject: id.subject})
+	if emailTaken(err) {
+		fail(w, http.StatusConflict, "email registered")
+		return
+	}
 	if err != nil {
 		internal(w, r, err)
 		return
 	}
-	token, err := newSession(r.Context(), s.q, user.ID)
+	reply(w, http.StatusCreated, authSession{Email: id.email, Token: token, Method: body.Provider})
+}
+
+// verifyIdentity writes the error response itself when the token can't be trusted.
+func (s *Server) verifyIdentity(w http.ResponseWriter, r *http.Request, provider, token string) (identity, bool) {
+	v, ok := s.providers[provider]
+	if !ok {
+		fail(w, http.StatusBadRequest, "unsupported provider")
+		return identity{}, false
+	}
+	id, err := v.verify(r.Context(), token)
+	if errors.Is(err, errInvalidToken) {
+		fail(w, http.StatusUnauthorized, "invalid credentials")
+		return identity{}, false
+	}
+	if err != nil {
+		internal(w, r, err)
+		return identity{}, false
+	}
+	return id, true
+}
+
+// openSession replies with a new session for an existing user.
+func (s *Server) openSession(w http.ResponseWriter, r *http.Request, userID pgtype.UUID, session authSession) {
+	member, err := s.q.GetMemberByUser(r.Context(), userID)
 	if err != nil {
 		internal(w, r, err)
 		return
 	}
-	reply(w, http.StatusOK, authSession{Email: c.Email, HasCompletedSetup: member.SetupComplete, Token: token})
+	session.HasCompletedSetup = member.SetupComplete
+	session.Token, err = newSession(r.Context(), s.q, userID)
+	if err != nil {
+		internal(w, r, err)
+		return
+	}
+	reply(w, http.StatusOK, session)
 }
 
 func newSession(ctx context.Context, q *store.Queries, userID pgtype.UUID) (string, error) {
@@ -236,26 +347,38 @@ func (s *Server) session(w http.ResponseWriter, r *http.Request) {
 		internal(w, r, err)
 		return
 	}
-	reply(w, http.StatusOK, authSession{Email: u.Email, HasCompletedSetup: u.SetupComplete})
+	reply(w, http.StatusOK, authSession{Email: u.Email, HasCompletedSetup: u.SetupComplete, Method: u.Method})
 }
 
-// deleteAccount removes the signed-in user after re-checking their password. Alone in the household,
+// deleteAccount removes the signed-in user after re-checking their password, or a fresh Apple or Google sign-in. Alone in the household,
 // the whole household goes; otherwise their personal bills, spending, name and pay go and the seat reopens.
 func (s *Server) deleteAccount(w http.ResponseWriter, r *http.Request, v viewer) {
 	var body struct {
-		Password string `json:"password"`
+		Password          string `json:"password"`
+		IDToken           string `json:"idToken"`
+		AuthorizationCode string `json:"authorizationCode"`
 	}
 	if !decode(w, r, &body) {
 		return
 	}
-	hash, err := s.q.GetPasswordHash(r.Context(), v.user)
+	creds, err := s.q.GetCredentials(r.Context(), v.user)
 	if err != nil {
 		internal(w, r, err)
 		return
 	}
-	if !verifyPassword(body.Password, hash) {
+	if creds.PasswordHash.Valid && !verifyPassword(body.Password, creds.PasswordHash.String) {
 		fail(w, http.StatusUnauthorized, "invalid credentials")
 		return
+	}
+	if !creds.PasswordHash.Valid {
+		id, ok := s.verifyIdentity(w, r, creds.Provider.String, body.IDToken)
+		if !ok {
+			return
+		}
+		if id.subject != creds.Subject.String || time.Since(id.issuedAt) > 5*time.Minute {
+			fail(w, http.StatusUnauthorized, "invalid credentials")
+			return
+		}
 	}
 	err = pgx.BeginFunc(r.Context(), s.pool, func(tx pgx.Tx) error {
 		q := s.q.WithTx(tx)
@@ -290,6 +413,12 @@ func (s *Server) deleteAccount(w http.ResponseWriter, r *http.Request, v viewer)
 	if err != nil {
 		internal(w, r, err)
 		return
+	}
+	// The account is already gone, so a failed revoke is only logged; the user can still remove Stór under their Apple ID settings.
+	if creds.Provider.String == "apple" && s.apple != nil && body.AuthorizationCode != "" {
+		if err := s.apple.revoke(context.WithoutCancel(r.Context()), body.AuthorizationCode); err != nil {
+			slog.Error("apple revoke failed", "err", err)
+		}
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

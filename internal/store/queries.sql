@@ -4,6 +4,12 @@ INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id;
 -- name: GetUserByEmail :one
 SELECT id, password_hash FROM users WHERE email = $1;
 
+-- name: CreateIdentity :exec
+INSERT INTO identities (provider, subject, user_id) VALUES ($1, $2, $3);
+
+-- name: GetUserByIdentity :one
+SELECT u.id, u.email FROM identities i JOIN users u ON u.id = i.user_id WHERE i.provider = $1 AND i.subject = $2;
+
 -- name: CreateHousehold :one
 INSERT INTO households DEFAULT VALUES RETURNING id;
 
@@ -17,9 +23,10 @@ INSERT INTO sessions (token_hash, user_id, expires_at) VALUES ($1, $2, $3);
 DELETE FROM sessions WHERE token_hash = $1;
 
 -- name: GetSessionUser :one
-SELECT u.email, h.setup_complete
+SELECT u.email, h.setup_complete, coalesce(i.provider, 'password')::text AS method
 FROM sessions s
 JOIN users u ON u.id = s.user_id
+LEFT JOIN identities i ON i.user_id = u.id
 JOIN members m ON m.user_id = u.id
 JOIN households h ON h.id = m.household_id
 WHERE s.token_hash = $1 AND s.expires_at > now();
@@ -164,8 +171,8 @@ INSERT INTO transfer_ticks (household_id, month, key) VALUES ($1, $2, $3) ON CON
 -- name: UntickTransfer :exec
 DELETE FROM transfer_ticks WHERE household_id = $1 AND month = $2 AND key = $3;
 
--- name: GetPasswordHash :one
-SELECT password_hash FROM users WHERE id = $1;
+-- name: GetCredentials :one
+SELECT u.password_hash, i.provider, i.subject FROM users u LEFT JOIN identities i ON i.user_id = u.id WHERE u.id = $1;
 
 -- name: DeleteUser :exec
 DELETE FROM users WHERE id = $1;

@@ -74,6 +74,10 @@ func (c client) expect(want int, method, path, token string, body any) map[strin
 }
 
 func setup(t *testing.T) (client, *pgxpool.Pool) {
+	return setupWith(t, Config{})
+}
+
+func setupWith(t *testing.T, cfg Config) (client, *pgxpool.Pool) {
 	url := os.Getenv("TEST_DATABASE_URL")
 	if url == "" {
 		t.Skip("TEST_DATABASE_URL not set; run `task test`")
@@ -90,7 +94,7 @@ func setup(t *testing.T) (client, *pgxpool.Pool) {
 	if _, err := pool.Exec(ctx, `TRUNCATE users, households CASCADE`); err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(New(pool))
+	srv := httptest.NewServer(New(pool, cfg))
 	t.Cleanup(srv.Close)
 	return client{t, srv.URL}, pool
 }
@@ -108,7 +112,7 @@ func TestAuth(t *testing.T) {
 	c.expect(401, "POST", "/auth/sign-in", "", map[string]string{"email": "nobody@example.com", "password": "password-1"})
 
 	session := c.expect(200, "POST", "/auth/sign-in", "", map[string]string{"email": "ANA@example.com", "password": "password-1"})
-	if session["email"] != "ana@example.com" || session["hasCompletedSetup"] != false || session["token"] == token {
+	if session["email"] != "ana@example.com" || session["hasCompletedSetup"] != false || session["token"] == token || session["method"] != "password" {
 		t.Fatalf("sign-in session = %v", session)
 	}
 
@@ -121,7 +125,7 @@ func TestAuth(t *testing.T) {
 	}
 
 	restored := c.expect(200, "GET", "/auth/session", token, nil)
-	if restored["email"] != "ana@example.com" || restored["hasCompletedSetup"] != true || restored["token"] != nil {
+	if restored["email"] != "ana@example.com" || restored["hasCompletedSetup"] != true || restored["token"] != nil || restored["method"] != "password" {
 		t.Fatalf("restored session = %v", restored)
 	}
 	c.expect(401, "GET", "/auth/session", "", nil)

@@ -46,6 +46,12 @@ type Household struct {
 	CashCapPence        pgtype.Int8
 }
 
+type Identity struct {
+	Provider string
+	Subject  string
+	UserID   pgtype.UUID
+}
+
 type Invite struct {
 	HouseholdID pgtype.UUID
 	CodeHash    []byte
@@ -92,5 +98,5 @@ type TransferTick struct {
 type User struct {
 	ID           pgtype.UUID
 	Email        string
-	PasswordHash string
+	PasswordHash pgtype.Text
 }
